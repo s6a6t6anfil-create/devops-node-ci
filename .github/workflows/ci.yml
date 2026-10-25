@@ -1,0 +1,43 @@
+name: Node.js CI
+
+'on':
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The original teacher build creates dist/index.html.
+env:
+  BUILD_OUTPUT: dist
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Check project input
+        run: node -e 'const p=require("./package.json"); if (!p.scripts?.build) throw new Error("Missing build script");'
+      - name: Install dependencies
+        run: npm install
+      - name: Build project
+        run: npm run build
+      - name: Check build output
+        run: test -s "$BUILD_OUTPUT/index.html"
+      - name: Upload build artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: node-build-${{ github.sha }}
+          path: ${{ env.BUILD_OUTPUT }}/
+          if-no-files-found: error
+          retention-days: 7
