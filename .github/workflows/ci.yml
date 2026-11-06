@@ -1,4 +1,4 @@
-name: Node.js CI
+name: Node.js CI and EC2 delivery
 
 'on':
   push:
@@ -8,14 +8,20 @@ name: Node.js CI
 permissions:
   contents: read
 
-# The original teacher build creates dist/index.html.
+# Serialize releases targeting this one training instance.
+concurrency:
+  group: ec2-delivery-${{ github.repository }}
+  cancel-in-progress: false
+
 env:
+  # The original teacher build creates dist/index.html.
   BUILD_OUTPUT: dist
+  APP_ENTRY: deploy/server.cjs
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -26,14 +32,14 @@ jobs:
         with:
           node-version: '24'
           package-manager-cache: false
-      - name: Check project input
-        run: node -e 'const p=require("./package.json"); if (!p.scripts?.build) throw new Error("Missing build script");'
       - name: Install dependencies
         run: npm install
+      - name: Check original Node output
+        run: test "$(node index.js)" = "Hello world!"
       - name: Build project
         run: npm run build
-      - name: Check build output
-        run: test -s "$BUILD_OUTPUT/index.html"
+      - name: Verify built page
+        run: test "$(cat dist/index.html)" = "<h1>Hello CI</h1>"
       - name: Upload build artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -41,3 +47,66 @@ jobs:
           path: ${{ env.BUILD_OUTPUT }}/
           if-no-files-found: error
           retention-days: 7
+
+      # CD is deliberately off until the user approves the real EC2 destination
+      # and storing the dedicated private key in this specific GitHub repository.
+      - name: Wait for a temporary SSH rule for this runner
+        if: ${{ vars.ENABLE_EC2_DEPLOY == 'true' }}
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          set -euo pipefail
+          [[ "$EC2_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]]
+          runner_ipv4=$(curl -4fsS --max-time 10 https://checkip.amazonaws.com)
+          [[ "$runner_ipv4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+          printf 'Allow inbound TCP 22 from this runner only: %s/32\n' "$runner_ipv4"
+          for attempt in {1..60}; do
+            if nc -z -w 2 "$EC2_HOST" 22; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo 'Timed out waiting for the temporary SSH rule' >&2
+          exit 1
+      - name: Decode SSH key and prepare verified host record
+        if: ${{ vars.ENABLE_EC2_DEPLOY == 'true' }}
+        env:
+          EC2_SSH_KEY_B64: ${{ secrets.EC2_SSH_KEY_B64 }}
+          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ -n "$EC2_SSH_KEY_B64" && -n "$EC2_KNOWN_HOSTS" ]]
+          umask 077
+          mkdir -p "$RUNNER_TEMP/optima-ssh"
+          printf '%s' "$EC2_SSH_KEY_B64" | base64 --decode > "$RUNNER_TEMP/optima-ssh/ec2-key.pem"
+          printf '%s\n' "$EC2_KNOWN_HOSTS" > "$RUNNER_TEMP/optima-ssh/known_hosts"
+          chmod 600 "$RUNNER_TEMP/optima-ssh/ec2-key.pem" "$RUNNER_TEMP/optima-ssh/known_hosts"
+          ssh-keygen -y -P '' -f "$RUNNER_TEMP/optima-ssh/ec2-key.pem" >/dev/null
+      - name: Copy project to EC2
+        if: ${{ vars.ENABLE_EC2_DEPLOY == 'true' }}
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$EC2_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
+          [[ "$EC2_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]]
+          ssh_args="-i $RUNNER_TEMP/optima-ssh/ec2-key.pem -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/optima-ssh/known_hosts"
+          ssh $ssh_args "$EC2_USER@$EC2_HOST" "mkdir -p \"\$HOME/nodeapp/incoming/$GITHUB_SHA\""
+          rsync -az --exclude=.git --exclude=node_modules --exclude=dist --exclude='.env*' --exclude='*.pem' --exclude='*.key' -e "ssh $ssh_args" ./ "$EC2_USER@$EC2_HOST:nodeapp/incoming/$GITHUB_SHA/"
+      - name: Start application on EC2
+        if: ${{ vars.ENABLE_EC2_DEPLOY == 'true' }}
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$EC2_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
+          [[ "$EC2_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]]
+          [[ "$APP_ENTRY" =~ ^[a-zA-Z0-9_./-]+$ && "$APP_ENTRY" != *..* && "$APP_ENTRY" != -* ]]
+          ssh -i "$RUNNER_TEMP/optima-ssh/ec2-key.pem" -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$RUNNER_TEMP/optima-ssh/known_hosts" "$EC2_USER@$EC2_HOST" "bash \"\$HOME/nodeapp/incoming/$GITHUB_SHA/deploy/run-remote.sh\" \"\$HOME/nodeapp/incoming/$GITHUB_SHA\" '$APP_ENTRY'"
+      - name: Remove temporary SSH material
+        if: ${{ always() && vars.ENABLE_EC2_DEPLOY == 'true' }}
+        run: rm -f "$RUNNER_TEMP/optima-ssh/ec2-key.pem" "$RUNNER_TEMP/optima-ssh/known_hosts"
