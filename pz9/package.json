@@ -1,0 +1,18 @@
+{
+  "name": "ci-node-demo",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Local preparation for Optima DevOps practical work 9",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "build": "node --check index.js && node scripts/build.cjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "pg": "^8.16.3"
+  }
+}

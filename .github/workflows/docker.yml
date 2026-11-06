@@ -1,0 +1,116 @@
+name: Docker build and optional approved EC2 deployment
+on:
+  push:
+    branches: [main]
+    paths: ['pz9/**', '.github/workflows/docker.yml']
+  pull_request:
+    paths: ['pz9/**', '.github/workflows/docker.yml']
+  workflow_dispatch:
+    inputs:
+      publish_image:
+        description: Publish image to the approved Docker Hub repository
+        type: boolean
+        default: false
+      deploy_ec2:
+        description: Deploy the published commit image to the approved EC2 server
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: pz9-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.revision.outputs.short }}
+    env:
+      IMAGE_OWNER: ${{ secrets.DOCKERHUB_USERNAME || 'local-optima' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: pz9/package-lock.json
+      - run: npm install
+        working-directory: pz9
+      - run: npm test && npm run build
+        working-directory: pz9
+      - id: revision
+        run: echo "short=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Require explicit publication settings
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_image
+        env:
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          test -n "$HUB_USER" && test -n "$HUB_TOKEN"
+      - uses: docker/setup-buildx-action@v4
+      - id: metadata
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE_OWNER }}/nodeapp
+          tags: |
+            type=ref,event=branch
+            type=sha
+            type=raw,value=${{ steps.revision.outputs.short }}
+      - name: Docker Hub login only after explicit selection
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_image
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: ./pz9
+          push: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_image }}
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+  deploy:
+    needs: image
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_image && inputs.deploy_ec2 && github.ref == 'refs/heads/main'
+    environment: ec2-production
+    runs-on: ubuntu-latest
+    env:
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      EC2_USER: ${{ secrets.EC2_USER }}
+      EC2_SSH_KEY_B64: ${{ secrets.EC2_SSH_KEY_B64 }}
+      EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+      HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+      POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+      IMAGE_TAG: ${{ needs.image.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy exact image tag through verified SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$EC2_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$EC2_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
+          [[ "$HUB_USER" =~ ^[a-z0-9][a-z0-9_-]*$ ]]
+          [[ "$IMAGE_TAG" =~ ^[0-9a-f]{12}$ ]]
+          [[ "$POSTGRES_PASSWORD" =~ ^[A-Za-z0-9._-]{20,}$ ]]
+          test -n "$EC2_SSH_KEY_B64" && test -n "$EC2_KNOWN_HOSTS"
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          printf '%s' "$EC2_SSH_KEY_B64" | base64 --decode > "$work/key"
+          printf '%s\n' "$EC2_KNOWN_HOSTS" > "$work/known_hosts"
+          # Never use ssh-keyscan as an unverified trust-on-first-use shortcut.
+          runner_ipv4=$(curl -4fsS --max-time 10 https://checkip.amazonaws.com)
+          [[ "$runner_ipv4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+          printf 'Allow TCP 22 for this runner only: %s/32\n' "$runner_ipv4"
+          for attempt in {1..60}; do
+            if nc -z -w 2 "$EC2_HOST" 22; then break; fi
+            if [[ "$attempt" == 60 ]]; then exit 1; fi
+            sleep 5
+          done
+          ssh_options=(-i "$work/key" -o UserKnownHostsFile="$work/known_hosts" -o StrictHostKeyChecking=yes -o BatchMode=yes)
+          ssh "${ssh_options[@]}" "$EC2_USER@$EC2_HOST" 'umask 077; mkdir -p "$HOME/devops-nodeapp"; chmod 700 "$HOME/devops-nodeapp"'
+          printf 'DOCKERHUB_USERNAME=%s\nIMAGE_TAG=%s\nPOSTGRES_PASSWORD=%s\nAPP_BIND_IP=127.0.0.1\nAPP_PORT=3000\n' "$HUB_USER" "$IMAGE_TAG" "$POSTGRES_PASSWORD" > "$work/.env"
+          scp "${ssh_options[@]}" "$work/.env" pz9/docker-compose.yml pz9/deploy/run-compose.sh "$EC2_USER@$EC2_HOST:devops-nodeapp/"
+          ssh "${ssh_options[@]}" "$EC2_USER@$EC2_HOST" 'cd "$HOME/devops-nodeapp"; chmod 600 .env; bash run-compose.sh'
