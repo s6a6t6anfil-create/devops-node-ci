@@ -3,6 +3,7 @@ set -euo pipefail
 # Intended only for a previously approved EC2 deployment directory.
 # This script does not install Docker, create EC2 or remove unrelated PM2 apps.
 test -f .env && test -f docker-compose.yml
+docker() { sudo /usr/bin/docker "$@"; }
 chmod 600 .env
 docker compose version
 # The lesson's old standalone nodeapp container is removed only if it is NOT
@@ -22,3 +23,9 @@ curl --fail --silent --show-error http://127.0.0.1:3000/healthz
 printf '\n'
 docker compose -p devops-nodeapp ps
 # No down -v: PostgreSQL data must survive application recreation.
+
+curl --fail --silent --show-error -X POST http://127.0.0.1:3000/visits
+printf '\n'
+curl --fail --silent --show-error http://127.0.0.1:3000/visits
+printf '\n'
+docker compose -p devops-nodeapp logs --tail 15 app

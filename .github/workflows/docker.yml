@@ -112,5 +112,5 @@ jobs:
           ssh_options=(-i "$work/key" -o UserKnownHostsFile="$work/known_hosts" -o StrictHostKeyChecking=yes -o BatchMode=yes)
           ssh "${ssh_options[@]}" "$EC2_USER@$EC2_HOST" 'umask 077; mkdir -p "$HOME/devops-nodeapp"; chmod 700 "$HOME/devops-nodeapp"'
           printf 'DOCKERHUB_USERNAME=%s\nIMAGE_TAG=%s\nPOSTGRES_PASSWORD=%s\nAPP_BIND_IP=127.0.0.1\nAPP_PORT=3000\n' "$HUB_USER" "$IMAGE_TAG" "$POSTGRES_PASSWORD" > "$work/.env"
-          scp "${ssh_options[@]}" "$work/.env" pz9/docker-compose.yml pz9/deploy/run-compose.sh "$EC2_USER@$EC2_HOST:devops-nodeapp/"
-          ssh "${ssh_options[@]}" "$EC2_USER@$EC2_HOST" 'cd "$HOME/devops-nodeapp"; chmod 600 .env; bash run-compose.sh'
+          scp "${ssh_options[@]}" "$work/.env" pz9/docker-compose.yml pz9/deploy/run-compose.sh pz9/deploy/prepare-ec2.sh "$EC2_USER@$EC2_HOST:devops-nodeapp/"
+          ssh "${ssh_options[@]}" "$EC2_USER@$EC2_HOST" 'cd "$HOME/devops-nodeapp"; chmod 600 .env; bash prepare-ec2.sh; bash run-compose.sh'
