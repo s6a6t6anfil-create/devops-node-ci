@@ -1,0 +1,62 @@
+name: PZ12 Terraform EC2 delivery
+'on':
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+concurrency:
+  group: pz12-ec2
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main' && vars.ENABLE_PZ12_DEPLOY == 'true'
+    environment: ec2-pz12
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: lts/*
+      - name: Test and build the existing PZ9 application
+        working-directory: pz9
+        run: npm ci && npm test && npm run build
+      - name: Verify destination and publish the commit image
+        id: publish
+        env:
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EXPECTED_IP: ${{ vars.PZ12_EXPECTED_IP }}
+          INSTANCE_ID: ${{ vars.PZ12_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+          [[ "$HUB_USER" =~ ^[a-z0-9][a-z0-9_-]*$ && -n "$HUB_TOKEN" ]]
+          python3 -c 'import ipaddress,os; a=ipaddress.IPv4Address(os.environ["EC2_HOST"]); assert a.is_global and str(a)==os.environ["EXPECTED_IP"]'
+          [[ "$INSTANCE_ID" =~ ^i-[0-9a-f]{17}$ && "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          tag="pz12-${GITHUB_SHA:0:12}"
+          export DOCKER_CONFIG
+          DOCKER_CONFIG=$(mktemp -d "$RUNNER_TEMP/pz12-docker.XXXXXX")
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          printf '%s' "$HUB_TOKEN" | docker login --username "$HUB_USER" --password-stdin
+          docker build -t "$HUB_USER/nodeapp:$tag" ./pz9
+          docker push "$HUB_USER/nodeapp:$tag"
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+      - name: Deploy tested image through pinned SSH
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY_B64: ${{ secrets.EC2_SSH_KEY_B64 }}
+          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          EXPECTED_IP: ${{ vars.PZ12_EXPECTED_IP }}
+          INSTANCE_ID: ${{ vars.PZ12_INSTANCE_ID }}
+          IMAGE_TAG: ${{ steps.publish.outputs.tag }}
+        run: |
+          bash pz12/deploy.sh
